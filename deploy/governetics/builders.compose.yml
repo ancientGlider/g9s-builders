@@ -44,7 +44,7 @@ services:
       - dind-data:/var/lib/docker
     restart: unless-stopped
   runner:
-    image: ghcr.io/ancientglider/g9s-builders/java:v0.2.1
+    image: ghcr.io/ancientglider/g9s-builders/java:v0.2.2
     network_mode: "service:vpn"
     environment:
       DOCKER_HOST: tcp://dind:2375

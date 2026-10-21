@@ -60,7 +60,7 @@ SILENCE_KILL = int(os.environ.get("G9S_SILENCE_KILL", "0"))     # … and for th
 MONITOR_STEP = 5
 ASKPASS = Path(__file__).resolve().parent / "askpass.sh"
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+-]{0,200}$")
-AUTH_FAIL_LIMIT = int(os.environ.get("G9S_AUTH_FAIL_LIMIT", "10"))   # failed auths per minute per client address …
+AUTH_FAIL_LIMIT = int(os.environ.get("G9S_AUTH_FAIL_LIMIT", "60"))   # failed auths per minute per client address …
 AUTH_FAIL_WINDOW = 60                                                  # … before 429 for the rest of the window
 AUTH_FAILS: dict[str, list[float]] = {}
 AUTH_LOCK = threading.Lock()
@@ -457,6 +457,7 @@ def run_build(bid: str) -> None:
     out.mkdir(exist_ok=True)
     meta.update(status="running", started_at=now_iso())
     save_meta(meta)
+    CURRENT.update(id=bid, proc=None, cancel=False)  # cancellable from this moment, even before the recipe starts
     started = time.monotonic()
     status, rc = "failed", None
     with (bdir / "build.log").open("ab") as logf:
@@ -479,6 +480,8 @@ def run_build(bid: str) -> None:
                        G9S_SUBMITTED_BY=meta["submitted_by"], G9S_STAGE=str(bdir / "stage"))
             for k, v in meta["params"].items():
                 env[f"G9S_PARAM_{k.upper()}"] = v
+            if CURRENT["cancel"]:
+                raise RuntimeError("cancelled before the recipe started")
             say("recipe start")
             script = recipes().get(meta["recipe"])
             if script is None:
@@ -500,7 +503,7 @@ def run_build(bid: str) -> None:
             meta["timeline"] = list(CURRENT["timeline"])
         except Exception as e:  # noqa: BLE001 - the log is the place for it
             say(f"runner error: {e!r}")
-            status = "failed"
+            status = "cancelled" if CURRENT["cancel"] else "failed"
         finally:
             CURRENT.update(id=None, proc=None, cancel=False, stage=None, stage_since=None, timeline=[], log=None,
                            stalled=False, last_output=None)
@@ -603,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
         return c["g9s_token"].value if "g9s_token" in c else None
 
     def client_ip(self) -> str:
-        fwd = self.headers.get("X-Forwarded-For")  # set by the edge; the LAN sees the socket address
+        fwd = self.headers.get("X-Forwarded-For") or self.headers.get("X-Real-IP")  # set by the edge, if it does
         return (fwd.split(",")[0].strip() if fwd else self.client_address[0])[:64]
 
     def throttled(self) -> bool:
@@ -722,9 +725,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file(p, "text/plain; charset=utf-8", int(q.get("from", "0")),
                                   {"X-Log-Size": str(p.stat().st_size), "X-Build-Status": meta["status"]})
         if sub == "/cancel" and m == "POST":
-            if meta["status"] == "running" and CURRENT["id"] == bid and CURRENT["proc"] is not None:
+            if meta["status"] == "running" and CURRENT["id"] == bid:
                 CURRENT["cancel"] = True
-                os.killpg(CURRENT["proc"].pid, signal.SIGTERM)
+                if CURRENT["proc"] is not None:
+                    os.killpg(CURRENT["proc"].pid, signal.SIGTERM)
                 log.info("build %s cancel requested by %s", bid, who)
                 return self.send_json(202, {"id": bid, "status": "cancelling"})
             if meta["status"] == "queued":
