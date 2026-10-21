@@ -11,6 +11,11 @@ G9S_RECIPE_FILES (delivered to the box as project files). Layout under G9S_RUNNE
   builds/<id>/build.log       runner header + recipe output + runner trailer
   builds/<id>/out/            artifacts the recipe wrote (served as-is)
 
+Pull mode: a project file «repo.<name>» (url=…, tags=<regex>, poll=<seconds>, credentials=<file with
+user:password>) makes the runner poll that repository's tags and build every new tag matching the
+regex, and lets clients ask for a build of any ref with POST /api/builds?recipe=…&ref=…; the
+bundle upload keeps working alongside (branches, or no repository access yet).
+
 Authentication: Bearer tokens from G9S_RUNNER_TOKENS, one «name=token» per line. The file is
 re-read on every request, so rotating a token is a file write, no restart. Everything but
 /api/health needs a token. A token lets its holder run arbitrary code inside the builder:
@@ -53,6 +58,8 @@ MAX_UPLOAD = int(os.environ.get("G9S_MAX_UPLOAD_MB", "512")) * 1024 * 1024
 SILENCE_WARN = int(os.environ.get("G9S_SILENCE_WARN", "600"))   # no output for this long → «stalled» flag
 SILENCE_KILL = int(os.environ.get("G9S_SILENCE_KILL", "0"))     # … and for this long → kill (0 = never)
 MONITOR_STEP = 5
+ASKPASS = Path(__file__).resolve().parent / "askpass.sh"
+REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+-]{0,200}$")
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RECIPE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -75,6 +82,7 @@ def now_iso() -> str:
 
 
 def git(repo: Path, *args: str, check: bool = True, **kw) -> subprocess.CompletedProcess:
+    kw.setdefault("timeout", 300)
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=check, **kw)
 
 
@@ -215,6 +223,131 @@ def import_bundle(recipe: str, commit: str, bundle: Path | None) -> None:
         git(repo, "update-ref", f"refs/builds/{commit}", commit)
 
 
+# ---------------------------------------------------------------- pull mode
+
+def repo_config(recipe: str) -> dict | None:
+    f = RECIPE_FILES / f"repo.{recipe}"
+    if not f.is_file():
+        return None
+    cfg = {"poll": "60", "tags": "", "credentials": ""}
+    for line in f.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip()
+    if not cfg.get("url"):
+        return None
+    cred = cfg["credentials"] or str(RECIPE_FILES / f"git_credentials.{recipe}")
+    if not Path(cred).is_file():
+        cred = str(RECIPE_FILES / "git_credentials")
+    cfg["credentials"] = cred if Path(cred).is_file() else ""
+    return cfg
+
+
+def git_env(cfg: dict) -> dict:
+    """Environment for git talking to the remote: askpass from the credentials file, no prompts."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    if cfg.get("credentials"):
+        user, _, password = Path(cfg["credentials"]).read_text().strip().partition(":")
+        env.update(GIT_ASKPASS=str(ASKPASS), G9S_GIT_USER=user, G9S_GIT_PASSWORD=password)
+    return env
+
+
+def remote_tags(cfg: dict) -> dict[str, str]:
+    out = subprocess.run(["git", "ls-remote", "--tags", "--refs", cfg["url"]], capture_output=True, text=True,
+                         env=git_env(cfg), timeout=120)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip().splitlines()[-1] if out.stderr.strip() else "git ls-remote failed")
+    tags = {}
+    for line in out.stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        if ref.startswith("refs/tags/"):
+            tags[ref[10:]] = sha
+    return tags
+
+
+def fetch_ref(recipe: str, cfg: dict, ref: str) -> str:
+    """Fetch `ref` (tag, branch, sha) from the remote into the recipe's bare repo; return its commit."""
+    repo = ensure_repo(recipe)
+    with STATE_LOCK:
+        f = git(repo, "fetch", "-q", "--no-tags", cfg["url"], ref, check=False, env=git_env(cfg), timeout=900)
+        if f.returncode != 0:
+            raise ImportError_("fetch_failed", f.stderr.strip()[-300:])
+        sha = git(repo, "rev-parse", "--verify", "-q", "FETCH_HEAD^{commit}").stdout.strip()
+        git(repo, "update-ref", f"refs/builds/{sha}", sha)
+    return sha
+
+
+def enqueue(recipe: str, commit: str, params: dict, who: str, trigger: str, bundle_bytes: int = 0) -> dict:
+    bid = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{commit[:7]}-{uuid.uuid4().hex[:4]}"
+    build_dir(bid).mkdir(parents=True)
+    meta = {"id": bid, "recipe": recipe, "commit": commit, "sha7": commit[:7], "params": params, "trigger": trigger,
+            "submitted_by": who, "submitted_at": now_iso(), "bundle_bytes": bundle_bytes, "status": "queued",
+            "started_at": None, "finished_at": None, "duration_s": None, "exit_code": None, "artifacts": []}
+    with STATE_LOCK:
+        save_meta(meta)
+    QUEUE.put(bid)
+    log.info("build %s queued: recipe=%s commit=%s by=%s trigger=%s params=%s", bid, recipe, commit, who, trigger, params)
+    return meta
+
+
+POLL_STATE: dict[str, dict] = {}  # recipe → {url, last_poll_at, last_ok_at, error, tags_seen}
+
+
+def poll_once(recipe: str, cfg: dict) -> None:
+    state_file = DATA / "repos" / f"{recipe}.tags.json"
+    st = POLL_STATE.setdefault(recipe, {"url": cfg["url"], "last_poll_at": None, "last_ok_at": None, "error": None, "tags_seen": 0})
+    st["last_poll_at"] = now_iso()
+    try:
+        tags = remote_tags(cfg)
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)[:300]
+        if st["error"] != msg:
+            log.warning("poll %s: %s", recipe, msg)
+        st["error"] = msg
+        return
+    if st["error"]:
+        log.info("poll %s: remote reachable again", recipe)
+    st.update(error=None, last_ok_at=now_iso(), tags_seen=len(tags))
+    seen = json.loads(state_file.read_text()) if state_file.exists() else None
+    if seen is None:
+        # first sight of the remote: remember what exists, build nothing from the past
+        state_file.write_text(json.dumps(tags, indent=0))
+        log.info("poll %s: %d existing tags recorded, new ones will be built (pattern %r)", recipe, len(tags), cfg["tags"])
+        return
+    pattern = re.compile(cfg["tags"]) if cfg["tags"] else None
+    for tag, sha in sorted(tags.items()):
+        if tag in seen:
+            continue
+        seen[tag] = sha
+        if pattern is None or not pattern.search(tag):
+            continue
+        try:
+            commit = fetch_ref(recipe, cfg, f"refs/tags/{tag}")
+            enqueue(recipe, commit, {}, "tag-poll", f"tag:{tag}")
+        except ImportError_ as e:
+            log.warning("poll %s: tag %s not fetched: %s", recipe, tag, e.detail)
+    state_file.write_text(json.dumps(seen, indent=0))
+
+
+def poller() -> None:
+    last: dict[str, float] = {}
+    while True:
+        for recipe in recipe_names():
+            cfg = repo_config(recipe)
+            if not cfg:
+                POLL_STATE.pop(recipe, None)
+                continue
+            every = max(15, int(cfg.get("poll") or 60))
+            if time.monotonic() - last.get(recipe, 0) >= every:
+                last[recipe] = time.monotonic()
+                try:
+                    poll_once(recipe, cfg)
+                except Exception:  # noqa: BLE001
+                    log.exception("poll %s crashed", recipe)
+        time.sleep(5)
+
+
 # ---------------------------------------------------------------- build worker
 
 def prune_recipe(recipe: str) -> None:
@@ -249,8 +382,6 @@ def monitor(proc: subprocess.Popen, stage_file: Path, log_path: Path, say) -> in
     CURRENT["last_output"] = time.time()
     while True:
         rc = proc.poll()
-        if rc is not None:
-            return rc
         now = time.monotonic()
         try:
             stage = stage_file.read_text().strip().splitlines()[0][:120]
@@ -260,6 +391,8 @@ def monitor(proc: subprocess.Popen, stage_file: Path, log_path: Path, say) -> in
             close_stage(now)
             CURRENT["timeline"].append({"stage": stage, "started_at": now_iso(), "duration_s": None, "_t0": now})
             CURRENT.update(stage=stage, stage_since=now_iso())
+        if rc is not None:
+            return rc
         size = log_path.stat().st_size if log_path.exists() else 0
         if size != last_size:
             last_size, CURRENT["last_output"] = size, time.time()
@@ -504,7 +637,8 @@ class Handler(BaseHTTPRequestHandler):
             if CURRENT["id"]:
                 running = {"id": CURRENT["id"], **{k: v for k, v in live(CURRENT["id"]).items() if k != "timeline"}}
             return self.send_json(200, {"status": "ok", "running": running, "queued": QUEUE.qsize(),
-                                        "recipes": recipe_names(), "tokens_file_present": TOKENS_FILE.exists()})
+                                        "recipes": recipe_names(), "tokens_file_present": TOKENS_FILE.exists(),
+                                        "repos": POLL_STATE})
         if path.startswith("/ui"):
             return self.ui(path, q)
         who = self.require_auth()
@@ -636,8 +770,8 @@ class Handler(BaseHTTPRequestHandler):
         recipe, commit = q.get("recipe", ""), q.get("commit", "").lower()
         if recipe not in recipe_names():
             raise HttpError(400, "unknown_recipe", f"known: {', '.join(recipe_names())}")
-        if not SHA_RE.match(commit):
-            raise HttpError(400, "bad_commit", "a full 40-hex commit id is required")
+        if not q.get("ref") and not SHA_RE.match(commit):
+            raise HttpError(400, "bad_commit", "a full 40-hex commit id is required (or ref=… in pull mode)")
         params = {}
         for k, v in q.items():
             if k.startswith("p_"):
@@ -645,26 +779,30 @@ class Handler(BaseHTTPRequestHandler):
                 if not PARAM_RE.match(key) or len(v) > 256 or any(c in v for c in "\n\r\0"):
                     raise HttpError(400, "bad_param", k)
                 params[key] = v
-        bid = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{commit[:7]}-{uuid.uuid4().hex[:4]}"
-        bdir = build_dir(bid)
-        bdir.mkdir(parents=True)
-        bundle = bdir / "upload.bundle"
-        size = self.read_body_to(bundle)
+        ref = q.get("ref", "")
+        if ref:
+            # pull mode: the runner fetches the ref itself from the configured remote
+            cfg = repo_config(recipe)
+            if not cfg:
+                raise HttpError(422, "repo_not_configured", f"no repo.{recipe} file on the builder")
+            if not REF_RE.match(ref) or ".." in ref:
+                raise HttpError(400, "bad_ref")
+            try:
+                commit = fetch_ref(recipe, cfg, ref)
+            except ImportError_ as e:
+                raise HttpError(422, e.code, e.detail)
+            meta = enqueue(recipe, commit, params, who, f"ref:{ref}")
+            return self.send_json(202, {"id": meta["id"], "commit": commit, "status": "queued", "position": QUEUE.qsize()})
+        tmp = DATA / "builds" / f"upload-{uuid.uuid4().hex}.bundle"
+        size = self.read_body_to(tmp)
         try:
-            import_bundle(recipe, commit, bundle if size else None)
+            import_bundle(recipe, commit, tmp if size else None)
         except ImportError_ as e:
-            shutil.rmtree(bdir, ignore_errors=True)
             raise HttpError(422, e.code, e.detail)
         finally:
-            bundle.unlink(missing_ok=True)
-        meta = {"id": bid, "recipe": recipe, "commit": commit, "sha7": commit[:7], "params": params,
-                "submitted_by": who, "submitted_at": now_iso(), "bundle_bytes": size, "status": "queued",
-                "started_at": None, "finished_at": None, "duration_s": None, "exit_code": None, "artifacts": []}
-        with STATE_LOCK:
-            save_meta(meta)
-        QUEUE.put(bid)
-        log.info("build %s queued: recipe=%s commit=%s by=%s bundle=%dB params=%s", bid, recipe, commit, who, size, params)
-        self.send_json(202, {"id": bid, "status": "queued", "position": QUEUE.qsize()})
+            tmp.unlink(missing_ok=True)
+        meta = enqueue(recipe, commit, params, who, "bundle", size)
+        self.send_json(202, {"id": meta["id"], "status": "queued", "position": QUEUE.qsize()})
 
 
 # ---------------------------------------------------------------- read-only UI
@@ -721,6 +859,7 @@ def main() -> None:
     (DATA / "repos").mkdir(parents=True, exist_ok=True)
     recover_on_start()
     threading.Thread(target=worker, name="builder", daemon=True).start()
+    threading.Thread(target=poller, name="poller", daemon=True).start()
     log.info("g9s runner on :%d, data=%s, recipes=%s, tokens=%s (%s)", PORT, DATA, recipe_names(), TOKENS_FILE,
              "present" if TOKENS_FILE.exists() else "MISSING")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

@@ -18,6 +18,8 @@ x-g9s-config:
     tokens: {consumers: [runner], visibility: invisible, mode: "0400"}
     npmrc: {consumers: [runner], visibility: invisible, mode: "0400", presence: optional}
     recipe.example: {consumers: [runner], mode: "0444"}
+    repo.example: {consumers: [runner], mode: "0444", presence: optional}
+    git_credentials.example: {consumers: [runner], visibility: invisible, mode: "0400", presence: optional}
     vpn.ovpn: {consumers: [vpn], visibility: invisible, mode: "0400"}
     vpn_user: {consumers: [vpn], visibility: invisible, mode: "0400"}
     vpn_password: {consumers: [vpn], visibility: invisible, mode: "0400"}
@@ -42,7 +44,7 @@ services:
       - dind-data:/var/lib/docker
     restart: unless-stopped
   runner:
-    image: ghcr.io/ancientglider/g9s-builders/java:v0.1.2
+    image: ghcr.io/ancientglider/g9s-builders/java:v0.2.0
     network_mode: "service:vpn"
     environment:
       DOCKER_HOST: tcp://dind:2375

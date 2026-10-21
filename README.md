@@ -49,6 +49,24 @@ g9s-build --url https://builders.example.org --recipe <рецепт> origin/mast
 Один сборщик делает одну сборку за раз, остальные ждут в очереди. Артефакты хранятся для последних пяти сборок
 каждого рецепта (`G9S_KEEP_BUILDS`), журналы и сводки — всегда.
 
+## Pull-режим: сборка по тегу
+
+Если у сборщика есть доступ к репозиторию (VPN, deploy token), он может ходить за исходниками сам. Файл проекта
+`repo.<рецепт>` (в `G9S_RECIPE_FILES`):
+
+```
+url=https://git.example.org/group/project.git
+tags=^v            # регулярное выражение на имя тега; пусто — по тегам не собирать
+poll=60            # период опроса, секунды
+```
+
+Учётные данные — файл `git_credentials.<рецепт>` (или общий `git_credentials`) со строкой `логин:пароль`
+(для GitLab — deploy token с `read_repository`). Раннер раз в `poll` секунд делает `git ls-remote --tags`;
+при первом опросе запоминает существующие теги и ничего не собирает, дальше каждый **новый** тег под шаблон
+ставится в очередь (`trigger: tag:<имя>`, `submitted_by: tag-poll`). Любой ref можно собрать руками:
+`g9s-build --pull <ветка|тег|sha>` → `POST /api/builds?recipe=…&ref=…`. Состояние опроса — в `/api/health`
+(`repos`: последний опрос, последняя удача, ошибка). Загрузка bundle работает параллельно.
+
 ## API раннера
 
 Все запросы, кроме `/api/health`, — с заголовком `Authorization: Bearer <токен>`.
@@ -59,11 +77,17 @@ g9s-build --url https://builders.example.org --recipe <рецепт> origin/mast
 | `GET /api/recipes` | список рецептов |
 | `GET /api/repos/<recipe>/tips` | до 50 коммитов, которые у сборщика уже есть (новые первыми) — чтобы прислать дельту |
 | `POST /api/builds?recipe=…&commit=<sha40>[&p_<ключ>=…]`, тело — bundle (можно пустое, если коммит известен) | `202 {id}`; `422 commit_unknown` — пришлите bundle с коммитом под ссылкой `refs/g9s/upload` |
+| `POST /api/builds?recipe=…&ref=<ref>[&p_<ключ>=…]` | pull-режим: раннер сам делает fetch; `202 {id, commit}`; `422 repo_not_configured` / `fetch_failed` |
+| `GET /api/stats?recipe=…` | медианы длительности сборки и стадий по успешным сборкам |
 | `GET /api/builds[?recipe=…&limit=…]` | последние сборки |
-| `GET /api/builds/<id>` | карточка: статус, время, кто поставил, артефакты с `sha256` |
+| `GET /api/builds/<id>` | карточка: статус, стадия и таймлайн стадий, признак «нет вывода N с», время, кто поставил, триггер, артефакты с `sha256` |
 | `GET /api/builds/<id>/log?from=<байт>` | хвост журнала; заголовки `X-Log-Size`, `X-Build-Status` |
 | `GET /api/builds/<id>/artifacts/<имя>` | файл |
 | `POST /api/builds/<id>/cancel` | снять с очереди или прервать |
+
+Страница `/ui` — список сборок, текущая стадия, живой журнал и артефакты; вход токеном (cookie браузера).
+Рецепт сообщает стадию строкой в файл `$G9S_STAGE`; молчание дольше `G9S_SILENCE_WARN` (600 с) помечается,
+дольше `G9S_SILENCE_KILL` (по умолчанию выключено) — прерывает сборку.
 
 Статусы: `queued` → `running` → `succeeded` / `failed` / `cancelled` / `timeout` (`G9S_BUILD_TIMEOUT`, 2 часа по
 умолчанию). Тело загрузки — до `G9S_MAX_UPLOAD_MB` (512).

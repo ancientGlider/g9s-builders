@@ -2,6 +2,7 @@
 # g9s-build — send a commit to a g9s-builders box and bring the artifacts back.
 #
 #   g9s-build [-u URL] [-r RECIPE] [-o DIR] [-p key=value]... [--no-wait] <commit-ish>
+#   g9s-build ... --pull <ref>      the builder fetches <ref> (tag, branch, sha) from its configured remote itself
 #
 # URL and token: --url / G9S_BUILDER_URL, G9S_BUILDER_TOKEN or ~/.config/g9s-builders/token.
 # Needs bash 3.2+, git, curl. Runs from inside the repository being built.
@@ -14,6 +15,7 @@ OUT=""
 PARAMS=""
 WAIT=1
 REV=""
+PULL=""
 
 usage() {
   sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
@@ -26,6 +28,7 @@ while [ $# -gt 0 ]; do
     -o|--out) OUT="$2"; shift 2 ;;
     -p|--param) PARAMS="$PARAMS&p_$2"; shift 2 ;;
     --no-wait) WAIT=0; shift ;;
+    --pull) PULL="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "unknown option $1" >&2; usage >&2; exit 2 ;;
     *) REV="$1"; shift ;;
@@ -36,15 +39,19 @@ done
 [ -n "$URL" ] || { echo "builder URL is not set (--url or G9S_BUILDER_URL)" >&2; exit 2; }
 [ -n "$TOKEN" ] || { echo "token is not set (G9S_BUILDER_TOKEN or ~/.config/g9s-builders/token)" >&2; exit 2; }
 [ -n "$RECIPE" ] || { echo "recipe is not set (--recipe or G9S_BUILDER_RECIPE)" >&2; exit 2; }
-[ -n "$REV" ] || { echo "commit is required" >&2; usage >&2; exit 2; }
+[ -n "$REV$PULL" ] || { echo "commit (or --pull ref) is required" >&2; usage >&2; exit 2; }
 URL="${URL%/}"
-
-SHA="$(git rev-parse --verify "${REV}^{commit}")"
-SHA7="${SHA:0:7}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"; git update-ref -d refs/g9s/upload 2>/dev/null || true' EXIT
 
 api() { curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" "$@"; }
+
+if [ -n "$PULL" ]; then
+  echo "builder: $URL, recipe $RECIPE, pull ref $PULL"
+  RESP="$(api -X POST --data-binary '' "$URL/api/builds?recipe=$RECIPE&ref=$PULL$PARAMS")"
+  SHA="$(printf '%s' "$RESP" | grep -oE '"commit": *"[0-9a-f]{40}"' | grep -oE '[0-9a-f]{40}')"
+else
+SHA="$(git rev-parse --verify "${REV}^{commit}")"
 
 # What the builder already has: exclude it from the bundle so the delta stays small.
 echo "builder: $URL, recipe $RECIPE, commit $SHA"
@@ -71,6 +78,8 @@ fi
 
 RESP="$(api -X POST -H 'Content-Type: application/octet-stream' --data-binary "@$BODY" \
   "$URL/api/builds?recipe=$RECIPE&commit=$SHA$PARAMS")"
+fi
+SHA7="${SHA:0:7}"
 ID="$(printf '%s' "$RESP" | grep -oE '"id": *"[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
 [ -n "$ID" ] || { echo "unexpected answer: $RESP" >&2; exit 1; }
 echo "build $ID queued (log: $URL/api/builds/$ID/log)"
