@@ -8,7 +8,7 @@
 # dind   — отдельный демон Docker для сборок (привилегированный контейнер, свой том образов);
 #          сокет хоста не используется, уборка образов на узле сборки не задевает.
 # runner — раннер g9s-builders: принимает bundle, собирает по рецепту, отдаёт артефакты.
-#          Порт 8181 слушает на всех адресах узла — закрывайте его экраном узла или
+#          Порт 9191 (→ 8181 раннера) слушает на всех адресах узла — закрывайте его экраном узла или
 #          публикуйте только через edge с TLS.
 #
 # tokens      — строки «имя=токен», один на человека. Токен = право исполнять код в сборщике.
@@ -31,7 +31,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "8181:8181"
+      - "9191:8181"
     restart: unless-stopped
   dind:
     # docker:28-dind, отпечаток снят 2026-10-21
@@ -44,7 +44,7 @@ services:
       - dind-data:/var/lib/docker
     restart: unless-stopped
   runner:
-    image: ghcr.io/ancientglider/g9s-builders/java:v0.2.0
+    image: ghcr.io/ancientglider/g9s-builders/java:v0.2.1
     network_mode: "service:vpn"
     environment:
       DOCKER_HOST: tcp://dind:2375

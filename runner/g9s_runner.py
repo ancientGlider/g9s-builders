@@ -60,6 +60,10 @@ SILENCE_KILL = int(os.environ.get("G9S_SILENCE_KILL", "0"))     # … and for th
 MONITOR_STEP = 5
 ASKPASS = Path(__file__).resolve().parent / "askpass.sh"
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+-]{0,200}$")
+AUTH_FAIL_LIMIT = int(os.environ.get("G9S_AUTH_FAIL_LIMIT", "10"))   # failed auths per minute per client address …
+AUTH_FAIL_WINDOW = 60                                                  # … before 429 for the rest of the window
+AUTH_FAILS: dict[str, list[float]] = {}
+AUTH_LOCK = threading.Lock()
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RECIPE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -598,10 +602,36 @@ class Handler(BaseHTTPRequestHandler):
         c = SimpleCookie(self.headers.get("Cookie") or "")
         return c["g9s_token"].value if "g9s_token" in c else None
 
-    def require_auth(self) -> str:
+    def client_ip(self) -> str:
+        fwd = self.headers.get("X-Forwarded-For")  # set by the edge; the LAN sees the socket address
+        return (fwd.split(",")[0].strip() if fwd else self.client_address[0])[:64]
+
+    def throttled(self) -> bool:
+        with AUTH_LOCK:
+            fails = [x for x in AUTH_FAILS.get(self.client_ip(), []) if time.time() - x < AUTH_FAIL_WINDOW]
+            AUTH_FAILS[self.client_ip()] = fails
+            return len(fails) >= AUTH_FAIL_LIMIT
+
+    def auth_failed(self) -> None:
+        with AUTH_LOCK:
+            AUTH_FAILS.setdefault(self.client_ip(), []).append(time.time())
+            n = len(AUTH_FAILS[self.client_ip()])
+        log.warning("auth failed from %s (%d/%d in %ds) %s %s", self.client_ip(), n, AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW,
+                    self.command, self.path.split("?")[0])
+
+    def who(self) -> str | None:
+        """The token holder's name, by Bearer header or UI cookie; None when not authenticated."""
+        if self.throttled():
+            raise HttpError(429, "too_many_failures", f"wait {AUTH_FAIL_WINDOW}s")
         who = authenticate(self.headers.get("Authorization"))
         if who is None and self.token_from_cookie():
             who = authenticate("Bearer " + self.token_from_cookie())
+        if who is None and (self.headers.get("Authorization") or self.token_from_cookie()):
+            self.auth_failed()
+        return who
+
+    def require_auth(self) -> str:
+        who = self.who()
         if who is None:
             if not TOKENS_FILE.exists():
                 raise HttpError(503, "tokens_unavailable", f"{TOKENS_FILE} is missing on the builder")
@@ -633,6 +663,9 @@ class Handler(BaseHTTPRequestHandler):
     def route(self, path: str, q: dict) -> None:
         m = self.command
         if path in ("/", "/api/health") and m in ("GET", "HEAD"):
+            if self.who() is None:
+                # anonymous: liveness only — no recipes, no repository addresses
+                return self.send_json(200, {"status": "ok"})
             running = None
             if CURRENT["id"]:
                 running = {"id": CURRENT["id"], **{k: v for k, v in live(CURRENT["id"]).items() if k != "timeline"}}
@@ -726,13 +759,16 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
             form = parse_qs(self.rfile.read(min(length, 4096)).decode(errors="replace"))
             token = (form.get("token") or [""])[0].strip()
+            if self.throttled():
+                return self.send_html(429, LOGIN_HTML.format(css=UI_CSS, msg="<p class=bad>Слишком много попыток, подождите минуту.</p>"))
             if authenticate("Bearer " + token) is None:
+                self.auth_failed()
                 return self.send_html(401, LOGIN_HTML.format(css=UI_CSS, msg="<p class=bad>Токен не принят.</p>"))
             return self.send_html(303, "", {"Location": "/ui",
                                             "Set-Cookie": f"g9s_token={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000"})
         if path == "/ui/logout":
             return self.send_html(303, "", {"Location": "/ui", "Set-Cookie": "g9s_token=; Path=/; Max-Age=0"})
-        who = authenticate("Bearer " + (self.token_from_cookie() or ""))
+        who = self.who()
         if who is None:
             return self.send_html(200, LOGIN_HTML.format(css=UI_CSS, msg=""))
         mb = re.fullmatch(r"/ui/builds/([^/]+)", path)
