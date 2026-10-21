@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# g9s-build — send a commit to a g9s-builders box and bring the artifacts back.
+#
+#   g9s-build [-u URL] [-r RECIPE] [-o DIR] [-p key=value]... [--no-wait] <commit-ish>
+#
+# URL and token: --url / G9S_BUILDER_URL, G9S_BUILDER_TOKEN or ~/.config/g9s-builders/token.
+# Needs bash 3.2+, git, curl. Runs from inside the repository being built.
+set -euo pipefail
+
+URL="${G9S_BUILDER_URL:-}"
+TOKEN="${G9S_BUILDER_TOKEN:-}"
+RECIPE="${G9S_BUILDER_RECIPE:-}"
+OUT=""
+PARAMS=""
+WAIT=1
+REV=""
+
+usage() {
+  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -u|--url) URL="$2"; shift 2 ;;
+    -r|--recipe) RECIPE="$2"; shift 2 ;;
+    -o|--out) OUT="$2"; shift 2 ;;
+    -p|--param) PARAMS="$PARAMS&p_$2"; shift 2 ;;
+    --no-wait) WAIT=0; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "unknown option $1" >&2; usage >&2; exit 2 ;;
+    *) REV="$1"; shift ;;
+  esac
+done
+
+[ -n "$TOKEN" ] || [ ! -f "$HOME/.config/g9s-builders/token" ] || TOKEN="$(cat "$HOME/.config/g9s-builders/token")"
+[ -n "$URL" ] || { echo "builder URL is not set (--url or G9S_BUILDER_URL)" >&2; exit 2; }
+[ -n "$TOKEN" ] || { echo "token is not set (G9S_BUILDER_TOKEN or ~/.config/g9s-builders/token)" >&2; exit 2; }
+[ -n "$RECIPE" ] || { echo "recipe is not set (--recipe or G9S_BUILDER_RECIPE)" >&2; exit 2; }
+[ -n "$REV" ] || { echo "commit is required" >&2; usage >&2; exit 2; }
+URL="${URL%/}"
+
+SHA="$(git rev-parse --verify "${REV}^{commit}")"
+SHA7="${SHA:0:7}"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"; git update-ref -d refs/g9s/upload 2>/dev/null || true' EXIT
+
+api() { curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" "$@"; }
+
+# What the builder already has: exclude it from the bundle so the delta stays small.
+echo "builder: $URL, recipe $RECIPE, commit $SHA"
+TIPS="$(api "$URL/api/repos/$RECIPE/tips" | grep -oE '[0-9a-f]{40}' || true)"
+HAVE=0
+EXCL=""
+for t in $TIPS; do
+  [ "$t" = "$SHA" ] && HAVE=1
+  git cat-file -e "$t^{commit}" 2>/dev/null && EXCL="$EXCL ^$t"
+done
+
+BODY="$TMP/empty"
+: > "$BODY"
+if [ "$HAVE" = 0 ]; then
+  git update-ref refs/g9s/upload "$SHA"
+  # shellcheck disable=SC2086 — EXCL is a list of ^sha words
+  git bundle create -q "$TMP/upload.bundle" refs/g9s/upload $EXCL
+  git update-ref -d refs/g9s/upload
+  BODY="$TMP/upload.bundle"
+  echo "bundle: $(wc -c < "$BODY" | tr -d ' ') bytes ($(echo $EXCL | wc -w | tr -d ' ') known tips excluded)"
+else
+  echo "bundle: not needed, the builder knows this commit"
+fi
+
+RESP="$(api -X POST -H 'Content-Type: application/octet-stream' --data-binary "@$BODY" \
+  "$URL/api/builds?recipe=$RECIPE&commit=$SHA$PARAMS")"
+ID="$(printf '%s' "$RESP" | grep -oE '"id": *"[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"
+[ -n "$ID" ] || { echo "unexpected answer: $RESP" >&2; exit 1; }
+echo "build $ID queued (log: $URL/api/builds/$ID/log)"
+[ "$WAIT" = 1 ] || exit 0
+
+OFF=0
+STATUS=queued
+while :; do
+  api -D "$TMP/h" -o "$TMP/chunk" "$URL/api/builds/$ID/log?from=$OFF" || true
+  if [ -s "$TMP/chunk" ]; then cat "$TMP/chunk"; fi
+  SIZE="$(grep -i '^X-Log-Size:' "$TMP/h" | tr -d '\r' | awk '{print $2}')"
+  STATUS="$(grep -i '^X-Build-Status:' "$TMP/h" | tr -d '\r' | awk '{print $2}')"
+  [ -n "$SIZE" ] && OFF="$SIZE"
+  case "$STATUS" in
+    succeeded|failed|cancelled|timeout) break ;;
+  esac
+  sleep 5
+done
+echo "build $ID: $STATUS"
+[ "$STATUS" = succeeded ] || exit 1
+
+OUT="${OUT:-./g9s-out/$RECIPE-$SHA7}"
+mkdir -p "$OUT"
+for name in $(api "$URL/api/builds/$ID" | grep -oE '"name": *"[^"]+"' | sed 's/.*"\([^"]*\)"$/\1/'); do
+  echo "fetching $name"
+  api -o "$OUT/$name" "$URL/api/builds/$ID/artifacts/$name"
+done
+echo "artifacts in $OUT:"
+ls -l "$OUT"

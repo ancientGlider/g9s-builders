@@ -1,0 +1,64 @@
+# Образец шаблона проекта сборщика для панели governetics. Свой шаблон держите у себя (в репозитории
+# проекта, который собираете): туда идут ключи рецептов и всё, что знает о проекте.
+#
+# vpn    — клиент OpenVPN к закрытой сети, если она нужна сборке. Раннер делит с ним сетевое
+#          пространство, поэтому порт раннера объявлен здесь. Профиль и логин приходят скрытыми
+#          файлами проекта; в образе их нет. Если закрытая сеть не нужна — уберите сервис, а порт
+#          и `network_mode` раннера верните ему.
+# dind   — отдельный демон Docker для сборок (привилегированный контейнер, свой том образов);
+#          сокет хоста не используется, уборка образов на узле сборки не задевает.
+# runner — раннер g9s-builders: принимает bundle, собирает по рецепту, отдаёт артефакты.
+#          Порт 8181 слушает на всех адресах узла — закрывайте его экраном узла или
+#          публикуйте только через edge с TLS.
+#
+# tokens      — строки «имя=токен», один на человека. Токен = право исполнять код в сборщике.
+# recipe.<имя> — скрипт рецепта (раннер находит его как рецепт «<имя>»); ключей может быть несколько.
+x-g9s-config:
+  files:
+    tokens: {consumers: [runner], visibility: invisible, mode: "0400"}
+    recipe.example: {consumers: [runner], mode: "0444"}
+    vpn.ovpn: {consumers: [vpn], visibility: invisible, mode: "0400"}
+    vpn_user: {consumers: [vpn], visibility: invisible, mode: "0400"}
+    vpn_password: {consumers: [vpn], visibility: invisible, mode: "0400"}
+services:
+  vpn:
+    image: ghcr.io/ancientglider/g9s-builders/openvpn:v0.1.0
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8181:8181"
+    restart: unless-stopped
+  dind:
+    # docker:28-dind, отпечаток снят 2026-10-21
+    image: docker:28-dind@sha256:2a232a42256f70d78e3cc5d2b5d6b3276710a0de0596c145f627ecfae90282ac
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    command: ["dockerd", "--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock"]
+    volumes:
+      - dind-data:/var/lib/docker
+    restart: unless-stopped
+  runner:
+    image: ghcr.io/ancientglider/g9s-builders/java:v0.1.2
+    network_mode: "service:vpn"
+    environment:
+      DOCKER_HOST: tcp://dind:2375
+      G9S_RUNNER_TOKENS: /etc/g9s/files/tokens
+      G9S_RECIPE_FILES: /etc/g9s/files
+      G9S_KEEP_BUILDS: "5"
+      G9S_BUILD_TIMEOUT: "7200"
+    volumes:
+      - builds:/data
+      - m2:/root/.m2
+      - npm-cache:/root/.npm
+    depends_on:
+      - vpn
+      - dind
+    restart: unless-stopped
+volumes:
+  dind-data: {}
+  builds: {}
+  m2: {}
+  npm-cache: {}
