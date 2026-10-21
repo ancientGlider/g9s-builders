@@ -20,6 +20,9 @@ issue them per person and keep the list short.
 from __future__ import annotations
 
 import hmac
+import html
+import resource
+import statistics
 import hashlib
 import json
 import logging
@@ -36,6 +39,7 @@ import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, urlparse
 
 PORT = int(os.environ.get("G9S_RUNNER_PORT", "8181"))
@@ -46,6 +50,9 @@ TOKENS_FILE = Path(os.environ.get("G9S_RUNNER_TOKENS", "/etc/g9s/files/tokens"))
 KEEP_BUILDS = int(os.environ.get("G9S_KEEP_BUILDS", "5"))
 BUILD_TIMEOUT = int(os.environ.get("G9S_BUILD_TIMEOUT", "7200"))
 MAX_UPLOAD = int(os.environ.get("G9S_MAX_UPLOAD_MB", "512")) * 1024 * 1024
+SILENCE_WARN = int(os.environ.get("G9S_SILENCE_WARN", "600"))   # no output for this long → «stalled» flag
+SILENCE_KILL = int(os.environ.get("G9S_SILENCE_KILL", "0"))     # … and for this long → kill (0 = never)
+MONITOR_STEP = 5
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RECIPE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -59,7 +66,8 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %
 
 QUEUE: "queue.Queue[str]" = queue.Queue()
 STATE_LOCK = threading.Lock()  # guards meta writes and repo imports
-CURRENT: dict = {"id": None, "proc": None, "cancel": False}
+CURRENT: dict = {"id": None, "proc": None, "cancel": False, "stage": None, "stage_since": None,
+                 "timeline": [], "log": None, "stalled": False, "last_output": None}
 
 
 def now_iso() -> str:
@@ -228,6 +236,82 @@ def prune_recipe(recipe: str) -> None:
         log.info("pruned artifacts of %s", bid)
 
 
+def close_stage(now_mono: float) -> None:
+    tl = CURRENT["timeline"]
+    if tl and tl[-1].get("duration_s") is None:
+        tl[-1]["duration_s"] = round(now_mono - tl[-1]["_t0"])
+
+
+def monitor(proc: subprocess.Popen, stage_file: Path, log_path: Path, say) -> int | None:
+    """Wait for the recipe while tracking its stage, output and silence. None = killed on time."""
+    t0 = time.monotonic()
+    last_size = log_path.stat().st_size if log_path.exists() else 0
+    CURRENT["last_output"] = time.time()
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            return rc
+        now = time.monotonic()
+        try:
+            stage = stage_file.read_text().strip().splitlines()[0][:120]
+        except (OSError, IndexError):
+            stage = None
+        if stage and stage != CURRENT["stage"]:
+            close_stage(now)
+            CURRENT["timeline"].append({"stage": stage, "started_at": now_iso(), "duration_s": None, "_t0": now})
+            CURRENT.update(stage=stage, stage_since=now_iso())
+        size = log_path.stat().st_size if log_path.exists() else 0
+        if size != last_size:
+            last_size, CURRENT["last_output"] = size, time.time()
+        silence = time.time() - CURRENT["last_output"]
+        stalled = silence > SILENCE_WARN
+        if stalled and not CURRENT["stalled"]:
+            log.warning("build %s: no output for %ds (stage %s)", CURRENT["id"], silence, CURRENT["stage"])
+        CURRENT["stalled"] = stalled
+        if SILENCE_KILL and silence > SILENCE_KILL:
+            say(f"no output for {int(silence)}s at stage «{CURRENT['stage']}» — killed (G9S_SILENCE_KILL={SILENCE_KILL})")
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            return None
+        if now - t0 > BUILD_TIMEOUT:
+            say(f"recipe killed after {BUILD_TIMEOUT}s")
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+            return None
+        time.sleep(MONITOR_STEP)
+
+
+def live(bid: str) -> dict:
+    """What is known about the running build right now (empty for any other build)."""
+    if CURRENT["id"] != bid or CURRENT["log"] is None:
+        return {}
+    size = CURRENT["log"].stat().st_size if CURRENT["log"].exists() else 0
+    silence = round(time.time() - (CURRENT["last_output"] or time.time()))
+    return {"stage": CURRENT["stage"], "stage_since": CURRENT["stage_since"], "log_bytes": size,
+            "silence_s": silence, "stalled": CURRENT["stalled"],
+            "timeline": [{k: v for k, v in e.items() if k != "_t0"} for e in CURRENT["timeline"]]}
+
+
+def stats(recipe: str | None) -> dict:
+    """Medians over succeeded builds: whole build and each stage — «usually N minutes»."""
+    durations, stages, n = [], {}, 0
+    for bid in list_build_ids():
+        meta = load_meta(bid)
+        if not meta or meta.get("status") != "succeeded" or (recipe and meta["recipe"] != recipe):
+            continue
+        n += 1
+        if meta.get("duration_s") is not None:
+            durations.append(meta["duration_s"])
+        for e in meta.get("timeline") or []:
+            if e.get("duration_s") is not None:
+                stages.setdefault(e["stage"], []).append(e["duration_s"])
+        if n >= 30:
+            break
+    return {"recipe": recipe, "succeeded_builds": n,
+            "median_duration_s": round(statistics.median(durations)) if durations else None,
+            "stages": {k: {"median_s": round(statistics.median(v)), "n": len(v)} for k, v in stages.items()}}
+
+
 def run_build(bid: str) -> None:
     meta = load_meta(bid)
     if not meta or meta["status"] != "queued":
@@ -255,7 +339,7 @@ def run_build(bid: str) -> None:
             env = dict(os.environ)
             env.update(G9S_BUILD_ID=bid, G9S_RECIPE=meta["recipe"], G9S_COMMIT=meta["commit"],
                        G9S_SHA7=meta["commit"][:7], G9S_SRC=str(src), G9S_OUT=str(out),
-                       G9S_SUBMITTED_BY=meta["submitted_by"])
+                       G9S_SUBMITTED_BY=meta["submitted_by"], G9S_STAGE=str(bdir / "stage"))
             for k, v in meta["params"].items():
                 env[f"G9S_PARAM_{k.upper()}"] = v
             say("recipe start")
@@ -264,24 +348,31 @@ def run_build(bid: str) -> None:
                 raise RuntimeError(f"recipe {meta['recipe']} is no longer available")
             proc = subprocess.Popen(["bash", str(script)], cwd=str(src), env=env,
                                     stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
-            CURRENT.update(id=bid, proc=proc, cancel=False)
-            try:
-                rc = proc.wait(timeout=BUILD_TIMEOUT)
-                status = "cancelled" if CURRENT["cancel"] else ("succeeded" if rc == 0 else "failed")
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
+            ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+            CURRENT.update(id=bid, proc=proc, cancel=False, stage="start", stage_since=now_iso(), timeline=[],
+                           log=bdir / "build.log", stalled=False, last_output=time.time())
+            stage_file, stage_t0 = bdir / "stage", time.monotonic()
+            rc = monitor(proc, stage_file, bdir / "build.log", say)
+            if rc is None:
                 status = "timeout"
-                say(f"recipe killed after {BUILD_TIMEOUT}s")
+            else:
+                status = "cancelled" if CURRENT["cancel"] else ("succeeded" if rc == 0 else "failed")
+            close_stage(time.monotonic())
+            ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+            meta["cpu_s"] = round((ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime))
+            meta["timeline"] = list(CURRENT["timeline"])
         except Exception as e:  # noqa: BLE001 - the log is the place for it
             say(f"runner error: {e!r}")
             status = "failed"
         finally:
-            CURRENT.update(id=None, proc=None, cancel=False)
+            CURRENT.update(id=None, proc=None, cancel=False, stage=None, stage_since=None, timeline=[], log=None,
+                           stalled=False, last_output=None)
             shutil.rmtree(src, ignore_errors=True)
             duration = round(time.monotonic() - started)
             say(f"finished: status={status} exit={rc} duration={duration}s")
     meta.update(status=status, exit_code=rc, finished_at=now_iso(), duration_s=duration, artifacts=scan_artifacts(out))
+    for e in meta.get("timeline") or []:
+        e.pop("_t0", None)
     with STATE_LOCK:
         save_meta(meta)
     log.info("build %s %s (%ss, %d artifacts)", bid, status, duration, len(meta["artifacts"]))
@@ -370,8 +461,14 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(400, "body_truncated")
         return got
 
+    def token_from_cookie(self) -> str | None:
+        c = SimpleCookie(self.headers.get("Cookie") or "")
+        return c["g9s_token"].value if "g9s_token" in c else None
+
     def require_auth(self) -> str:
         who = authenticate(self.headers.get("Authorization"))
+        if who is None and self.token_from_cookie():
+            who = authenticate("Bearer " + self.token_from_cookie())
         if who is None:
             if not TOKENS_FILE.exists():
                 raise HttpError(503, "tokens_unavailable", f"{TOKENS_FILE} is missing on the builder")
@@ -403,9 +500,17 @@ class Handler(BaseHTTPRequestHandler):
     def route(self, path: str, q: dict) -> None:
         m = self.command
         if path in ("/", "/api/health") and m in ("GET", "HEAD"):
-            return self.send_json(200, {"status": "ok", "running": CURRENT["id"], "queued": QUEUE.qsize(),
+            running = None
+            if CURRENT["id"]:
+                running = {"id": CURRENT["id"], **{k: v for k, v in live(CURRENT["id"]).items() if k != "timeline"}}
+            return self.send_json(200, {"status": "ok", "running": running, "queued": QUEUE.qsize(),
                                         "recipes": recipe_names(), "tokens_file_present": TOKENS_FILE.exists()})
+        if path.startswith("/ui"):
+            return self.ui(path, q)
         who = self.require_auth()
+
+        if path == "/api/stats" and m == "GET":
+            return self.send_json(200, stats(q.get("recipe")))
 
         if path == "/api/recipes" and m == "GET":
             return self.send_json(200, recipe_names())
@@ -442,7 +547,7 @@ class Handler(BaseHTTPRequestHandler):
         if not meta:
             raise HttpError(404, "build_not_found")
         if sub == "" and m == "GET":
-            return self.send_json(200, meta)
+            return self.send_json(200, {**meta, **live(bid)})
         if sub == "/log" and m in ("GET", "HEAD"):
             p = build_dir(bid) / "build.log"
             if not p.exists():
@@ -470,6 +575,62 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file(p, "application/octet-stream",
                                   headers={"Content-Disposition": f'attachment; filename="{name}"'})
         raise HttpError(405, "method_not_allowed")
+
+    def send_html(self, status: int, body: str, headers: dict | None = None) -> None:
+        data = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def ui(self, path: str, q: dict) -> None:
+        if path == "/ui/login" and self.command == "POST":
+            length = int(self.headers.get("Content-Length") or 0)
+            form = parse_qs(self.rfile.read(min(length, 4096)).decode(errors="replace"))
+            token = (form.get("token") or [""])[0].strip()
+            if authenticate("Bearer " + token) is None:
+                return self.send_html(401, LOGIN_HTML.format(css=UI_CSS, msg="<p class=bad>Токен не принят.</p>"))
+            return self.send_html(303, "", {"Location": "/ui",
+                                            "Set-Cookie": f"g9s_token={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000"})
+        if path == "/ui/logout":
+            return self.send_html(303, "", {"Location": "/ui", "Set-Cookie": "g9s_token=; Path=/; Max-Age=0"})
+        who = authenticate("Bearer " + (self.token_from_cookie() or ""))
+        if who is None:
+            return self.send_html(200, LOGIN_HTML.format(css=UI_CSS, msg=""))
+        mb = re.fullmatch(r"/ui/builds/([^/]+)", path)
+        if mb:
+            bid = mb.group(1)
+            if not BUILD_ID_RE.match(bid) or not load_meta(bid):
+                return self.send_html(404, "<p>Нет такой сборки.</p>")
+            return self.send_html(200, BUILD_HTML.format(css=UI_CSS, id=html.escape(bid), idjs=json.dumps(bid)))
+        if path == "/ui":
+            rows = []
+            for bid in list_build_ids()[:50]:
+                meta = load_meta(bid)
+                if not meta:
+                    continue
+                lv = live(bid)
+                stage = lv.get("stage") or ""
+                if lv.get("stalled"):
+                    stage += f" <span class=bad>(нет вывода {lv['silence_s']} с)</span>"
+                cls = "ok" if meta["status"] == "succeeded" else ("run" if meta["status"] in ("running", "queued") else "bad")
+                rows.append(f"<tr><td><a href=/ui/builds/{bid}>{bid}</a></td><td>{html.escape(meta['recipe'])}</td>"
+                            f"<td>{meta['commit'][:12]}</td><td>{html.escape(meta['submitted_by'])}</td>"
+                            f"<td class={cls}>{meta['status']}</td><td>{stage}</td><td>{fmt_dur(meta.get('duration_s'))}</td></tr>")
+            running = "Сейчас: ничего не собирается." if not CURRENT["id"] else \
+                f"Сейчас: <a href=/ui/builds/{CURRENT['id']}>{CURRENT['id']}</a>, стадия «{html.escape(CURRENT['stage'] or '')}»; в очереди {QUEUE.qsize()}."
+            st = []
+            for r in recipe_names():
+                s = stats(r)
+                if s["median_duration_s"]:
+                    st.append(f"{html.escape(r)}: обычно {fmt_dur(s['median_duration_s'])} (по {s['succeeded_builds']} сборкам)")
+            return self.send_html(200, LIST_HTML.format(css=UI_CSS, who=html.escape(who), running=running,
+                                                        rows="".join(rows), stats="; ".join(st)))
+        return self.send_html(404, "<p>Нет такой страницы.</p>")
 
     def submit(self, q: dict, who: str) -> None:
         recipe, commit = q.get("recipe", ""), q.get("commit", "").lower()
@@ -504,6 +665,55 @@ class Handler(BaseHTTPRequestHandler):
         QUEUE.put(bid)
         log.info("build %s queued: recipe=%s commit=%s by=%s bundle=%dB params=%s", bid, recipe, commit, who, size, params)
         self.send_json(202, {"id": bid, "status": "queued", "position": QUEUE.qsize()})
+
+
+# ---------------------------------------------------------------- read-only UI
+
+UI_CSS = """body{font:14px/1.4 system-ui,sans-serif;margin:1.5rem;color:#222;background:#fafafa}
+table{border-collapse:collapse;width:100%}td,th{padding:.3rem .6rem;border-bottom:1px solid #ddd;text-align:left;
+white-space:nowrap}th{background:#eee}a{color:#0645ad}pre{background:#111;color:#ddd;padding:1rem;overflow:auto;
+max-height:70vh;font:12px/1.35 ui-monospace,monospace}.ok{color:#1a7f37}.bad{color:#b42318}.run{color:#9a6700}
+.muted{color:#777}dl{display:grid;grid-template-columns:max-content 1fr;gap:.2rem 1rem}dt{color:#777}"""
+
+LOGIN_HTML = """<!doctype html><meta charset=utf-8><title>g9s builder</title><style>{css}</style>
+<h2>g9s builder</h2><p>Токен разработчика (хранится в cookie этого браузера):</p>
+<form method=post action=/ui/login><input name=token size=56 autofocus> <button>Войти</button></form>{msg}"""
+
+LIST_HTML = """<!doctype html><meta charset=utf-8><title>g9s builder</title><style>{css}</style>
+<h2>g9s builder <span class=muted>— {who}</span> <a href=/ui/logout class=muted style="font-size:.8em">выйти</a></h2>
+<p>{running}</p><table><tr><th>сборка</th><th>рецепт</th><th>коммит</th><th>кто</th><th>статус</th><th>стадия</th>
+<th>длительность</th></tr>{rows}</table><p class=muted>{stats}</p>"""
+
+BUILD_HTML = """<!doctype html><meta charset=utf-8><title>{id}</title><style>{css}</style>
+<p><a href=/ui>← сборки</a></p><h2>{id}</h2><dl id=meta></dl><h3>Артефакты</h3><ul id=art></ul>
+<h3>Журнал <span id=tail class=muted></span></h3><pre id=log></pre>
+<script>
+const id={idjs};let off=0,done=false;
+function cls(s){{return s=='succeeded'?'ok':(s=='running'||s=='queued')?'run':'bad'}}
+async function tick(){{
+  const m=await (await fetch('/api/builds/'+id)).json();
+  const tl=(m.timeline||[]).map(e=>e.stage+(e.duration_s!=null?' ('+e.duration_s+' с)':' …')).join(' → ');
+  document.getElementById('meta').innerHTML=
+   `<dt>статус</dt><dd class=${{cls(m.status)}}>${{m.status}}${{m.stalled?' — нет вывода '+m.silence_s+' с':''}}</dd>`+
+   `<dt>рецепт</dt><dd>${{m.recipe}}</dd><dt>коммит</dt><dd>${{m.commit}}</dd><dt>кто</dt><dd>${{m.submitted_by}}</dd>`+
+   `<dt>стадия</dt><dd>${{m.stage||'—'}}</dd><dt>стадии</dt><dd>${{tl||'—'}}</dd>`+
+   `<dt>начало</dt><dd>${{m.started_at||'—'}}</dd><dt>длительность</dt><dd>${{m.duration_s!=null?m.duration_s+' с':'—'}}</dd>`;
+  document.getElementById('art').innerHTML=(m.artifacts||[]).map(a=>`<li><a href="/api/builds/${{id}}/artifacts/${{a.name}}">${{a.name}}</a> <span class=muted>${{a.size}} B · ${{a.sha256.slice(0,12)}}</span></li>`).join('')||'<li class=muted>нет</li>';
+  const r=await fetch('/api/builds/'+id+'/log?from='+off);const txt=await r.text();
+  if(txt){{const pre=document.getElementById('log');const stick=pre.scrollTop+pre.clientHeight>=pre.scrollHeight-20;
+    pre.textContent+=txt;off=parseInt(r.headers.get('X-Log-Size')||off);if(stick)pre.scrollTop=pre.scrollHeight;}}
+  document.getElementById('tail').textContent=off+' B';
+  done=['succeeded','failed','cancelled','timeout'].includes(m.status);
+  if(!done)setTimeout(tick,3000);
+}}
+tick();
+</script>"""
+
+
+def fmt_dur(s) -> str:
+    if s is None:
+        return "—"
+    return f"{s // 60} мин {s % 60} с" if s >= 60 else f"{s} с"
 
 
 def main() -> None:

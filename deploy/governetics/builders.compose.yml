@@ -16,6 +16,7 @@
 x-g9s-config:
   files:
     tokens: {consumers: [runner], visibility: invisible, mode: "0400"}
+    npmrc: {consumers: [runner], visibility: invisible, mode: "0400", presence: optional}
     recipe.example: {consumers: [runner], mode: "0444"}
     vpn.ovpn: {consumers: [vpn], visibility: invisible, mode: "0400"}
     vpn_user: {consumers: [vpn], visibility: invisible, mode: "0400"}
@@ -47,6 +48,7 @@ services:
       DOCKER_HOST: tcp://dind:2375
       G9S_RUNNER_TOKENS: /etc/g9s/files/tokens
       G9S_RECIPE_FILES: /etc/g9s/files
+      NPM_CONFIG_USERCONFIG: /etc/g9s/files/npmrc
       G9S_KEEP_BUILDS: "5"
       G9S_BUILD_TIMEOUT: "7200"
     volumes:
