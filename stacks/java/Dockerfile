@@ -9,6 +9,9 @@ FROM node:24-bookworm-slim@sha256:91acba91b842bec0bf7ea6f5e09c644c7ccad72c4996ed
 # docker:28-cli, digest taken 2026-10-21 (linux/amd64 manifest list)
 FROM docker:28-cli@sha256:625d9431a9f54c5a2bc90f24f0e1c3d55b1349fd857dd85035f98c2c9acbdd4d AS dockercli
 
+# registry:3 (CNCF Distribution 3.1.2), digest taken 2026-10-22: its binary runs the registry's garbage collection
+FROM registry:3@sha256:be9a7062dd7e3316e5c0368e42740dc991a9ceb5d382317675a8738db0112af0 AS distribution
+
 # eclipse-temurin:25-jdk-noble, digest taken 2026-10-21 (linux/amd64 manifest list)
 FROM eclipse-temurin:25-jdk-noble@sha256:ba0f0e1a33864105e1d454e88105c617ab40f71062db1f306bf58be32a3f8e5e
 
@@ -27,6 +30,9 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
 COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+
+# Registry binary for retention: the runner mounts the registry's storage and runs `registry garbage-collect`.
+COPY --from=distribution /bin/registry /usr/local/bin/registry
 
 # UTF-8 locale: Maven Enforcer rules in some projects reject POSIX file-name encoding.
 ENV LANG=C.UTF-8 \

@@ -29,6 +29,8 @@ issue them per person and keep the list short.
 from __future__ import annotations
 
 import hmac
+import urllib.request
+import urllib.error
 import html
 import resource
 import statistics
@@ -65,6 +67,13 @@ MONITOR_STEP = 5
 REGISTRY = os.environ.get("G9S_REGISTRY", "")                    # e.g. registry:5000; empty = no publishing
 REGISTRY_NS = os.environ.get("G9S_REGISTRY_NAMESPACE", "builds")
 MOVING_TAG_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
+SHA7_TAG_RE = re.compile(r"^[0-9a-f]{7}$")
+REGISTRY_KEEP = int(os.environ.get("G9S_REGISTRY_KEEP", "10"))
+REGISTRY_STORAGE = Path(os.environ.get("G9S_REGISTRY_STORAGE", "/var/lib/registry"))
+ADMINS = {a.strip() for a in os.environ.get("G9S_ADMINS", "").split(",") if a.strip()}
+MANIFEST_ACCEPT = ", ".join(["application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json",
+                             "application/vnd.docker.distribution.manifest.list.v2+json",
+                             "application/vnd.docker.distribution.manifest.v2+json"])
 ASKPASS = Path(__file__).resolve().parent / "askpass.sh"
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+-]{0,200}$")
 AUTH_FAIL_LIMIT = int(os.environ.get("G9S_AUTH_FAIL_LIMIT", "60"))   # failed auths per minute per client address …
@@ -84,6 +93,8 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %
 
 QUEUE: "queue.Queue[str]" = queue.Queue()
 STATE_LOCK = threading.Lock()  # guards meta writes and repo imports
+BUILD_GATE = threading.Lock()  # a build (with its publish) and a registry cleanup never overlap
+CLEANUP: dict = {"running": False, "last": None}
 CURRENT: dict = {"id": None, "proc": None, "cancel": False, "stage": None, "stage_since": None,
                  "timeline": [], "log": None, "stalled": False, "last_output": None}
 
@@ -578,11 +589,108 @@ def run_build(bid: str) -> None:
     prune_recipe(meta["recipe"])
 
 
+# ---------------------------------------------------------------- registry retention
+
+def reg_request(method: str, path: str, headers: dict | None = None):
+    req = urllib.request.Request(f"http://{REGISTRY}{path}", method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def reg_tags() -> dict[str, dict[str, str]]:
+    """repository → {tag: digest} as the registry sees it now."""
+    _, _, body = reg_request("GET", "/v2/_catalog?n=1000")
+    out = {}
+    for repo in json.loads(body or b"{}").get("repositories", []):
+        _, _, tb = reg_request("GET", f"/v2/{repo}/tags/list")
+        tags = json.loads(tb or b"{}").get("tags") or []
+        out[repo] = {}
+        for tag in tags:
+            st, h, _ = reg_request("HEAD", f"/v2/{repo}/manifests/{tag}", {"Accept": MANIFEST_ACCEPT})
+            dg = {k.lower(): v for k, v in h.items()}.get("docker-content-digest")
+            if st == 200 and dg:
+                out[repo][tag] = dg
+    return out
+
+
+def storage_bytes() -> int:
+    total = 0
+    for root, _, files in os.walk(REGISTRY_STORAGE):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(root, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def cleanup_plan(keep: int) -> dict:
+    """What stays and what goes: per repository keep every digest a moving tag points to (stand, …) and the
+    digests of the newest `keep` builds that published there (order — the runner's own build records); every
+    other tag's digest is a deletion candidate. Tags the runner never recorded count as old."""
+    tags = reg_tags()
+    newest: dict[str, list[str]] = {}
+    for bid in list_build_ids():                      # newest first
+        meta = load_meta(bid) or {}
+        for item in meta.get("published") or []:
+            repo, dg = item.get("image"), item.get("digest")
+            if repo and dg and dg not in newest.setdefault(repo, []):
+                newest[repo].append(dg)
+    plan = {"keep": keep, "repos": {}}
+    for repo, tag_digests in sorted(tags.items()):
+        kept = {dg for tag, dg in tag_digests.items() if not SHA7_TAG_RE.match(tag)}
+        kept |= set(newest.get(repo, [])[:keep])
+        drop = sorted({dg for dg in tag_digests.values() if dg not in kept})
+        plan["repos"][repo] = {"tags": len(tag_digests),
+                               "moving": sorted(t for t in tag_digests if not SHA7_TAG_RE.match(t)),
+                               "keep_digests": len(kept & set(tag_digests.values())),
+                               "drop": [{"digest": dg, "tags": sorted(t for t, d in tag_digests.items() if d == dg)}
+                                        for dg in drop]}
+    return plan
+
+
+def run_cleanup(keep: int, who: str) -> None:
+    started, before = now_iso(), storage_bytes()
+    result = {"by": who, "keep": keep, "started_at": started, "deleted": [], "errors": [], "gc": None}
+    try:
+        with BUILD_GATE:                              # no build pushes while manifests and blobs go away
+            plan = cleanup_plan(keep)
+            for repo, r in plan["repos"].items():
+                for d in r["drop"]:
+                    st, _, body = reg_request("DELETE", f"/v2/{repo}/manifests/{d['digest']}")
+                    (result["deleted"] if st == 202 else result["errors"]).append(
+                        {"repo": repo, "tags": d["tags"], "digest": d["digest"], "status": st})
+            cfg = DATA / "registry-gc.yml"
+            cfg.write_text(f"version: 0.1\nstorage:\n  filesystem:\n    rootdirectory: {REGISTRY_STORAGE}\n"
+                           "  delete:\n    enabled: true\n")
+            gc = subprocess.run(["registry", "garbage-collect", "--delete-untagged", str(cfg)],
+                                capture_output=True, text=True, timeout=3600)
+            result["gc"] = {"exit": gc.returncode, "tail": (gc.stderr or gc.stdout).strip().splitlines()[-3:]}
+    except Exception as e:  # noqa: BLE001
+        result["errors"].append({"error": repr(e)[:300]})
+    result.update(finished_at=now_iso(), bytes_before=before, bytes_after=storage_bytes())
+    CLEANUP.update(running=False, last=result)
+    log.info("registry cleanup by %s: deleted %d, errors %d, %d → %d bytes", who, len(result["deleted"]),
+             len(result["errors"]), before, result["bytes_after"])
+
+
+def start_cleanup(keep: int, who: str) -> bool:
+    if CLEANUP["running"]:
+        return False
+    CLEANUP["running"] = True
+    threading.Thread(target=run_cleanup, args=(keep, who), name="registry-cleanup", daemon=True).start()
+    return True
+
+
 def worker() -> None:
     while True:
         bid = QUEUE.get()
         try:
-            run_build(bid)
+            with BUILD_GATE:
+                run_build(bid)
         except Exception:  # noqa: BLE001
             log.exception("build %s crashed the worker loop", bid)
 
@@ -738,6 +846,26 @@ class Handler(BaseHTTPRequestHandler):
             return self.ui(path, q)
         who = self.require_auth()
 
+        if path == "/api/registry" and m == "GET":
+            if not REGISTRY:
+                raise HttpError(404, "no_registry")
+            keep = int(q.get("keep", REGISTRY_KEEP))
+            return self.send_json(200, {"registry": REGISTRY, "storage_bytes": storage_bytes(), "cleanup": CLEANUP,
+                                        "plan": cleanup_plan(keep)})
+
+        if path == "/api/registry/cleanup" and m == "POST":
+            if not REGISTRY:
+                raise HttpError(404, "no_registry")
+            if who not in ADMINS:
+                raise HttpError(403, "admins_only", "G9S_ADMINS")
+            keep = max(1, int(q.get("keep", REGISTRY_KEEP)))
+            if q.get("dry_run") in ("1", "true", "yes"):
+                return self.send_json(200, cleanup_plan(keep))
+            if not start_cleanup(keep, who):
+                raise HttpError(409, "cleanup_running")
+            return self.send_json(202, {"status": "started", "keep": keep,
+                                        "note": "waits for a running build to finish; see GET /api/registry"})
+
         if path == "/api/stats" and m == "GET":
             return self.send_json(200, stats(q.get("recipe")))
 
@@ -829,6 +957,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_html(401, LOGIN_HTML.format(css=UI_CSS, msg="<p class=bad>Токен не принят.</p>"))
             return self.send_html(303, "", {"Location": "/ui",
                                             "Set-Cookie": f"g9s_token={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000"})
+        if path == "/ui/registry/cleanup" and self.command == "POST":
+            who = self.who()
+            if who is None or who not in ADMINS:
+                return self.send_html(403, "<p>Уборка реестра — только администраторам сборщика.</p>")
+            length = int(self.headers.get("Content-Length") or 0)
+            form = parse_qs(self.rfile.read(min(length, 1024)).decode(errors="replace"))
+            keep = max(1, int((form.get("keep") or [REGISTRY_KEEP])[0] or REGISTRY_KEEP))
+            start_cleanup(keep, who)
+            return self.send_html(303, "", {"Location": "/ui#registry"})
         if path == "/ui/logout":
             return self.send_html(303, "", {"Location": "/ui", "Set-Cookie": "g9s_token=; Path=/; Max-Age=0"})
         who = self.who()
@@ -862,8 +999,33 @@ class Handler(BaseHTTPRequestHandler):
                 if s["median_duration_s"]:
                     st.append(f"{html.escape(r)}: обычно {fmt_dur(s['median_duration_s'])} (по {s['succeeded_builds']} сборкам)")
             return self.send_html(200, LIST_HTML.format(css=UI_CSS, who=html.escape(who), running=running,
-                                                        rows="".join(rows), stats="; ".join(st)))
+                                                        rows="".join(rows), stats="; ".join(st),
+                                                        registry=self.ui_registry(who)))
         return self.send_html(404, "<p>Нет такой страницы.</p>")
+
+    def ui_registry(self, who: str) -> str:
+        if not REGISTRY:
+            return ""
+        try:
+            plan = cleanup_plan(REGISTRY_KEEP)
+        except Exception as e:  # noqa: BLE001
+            return f"<h3 id=registry>Реестр</h3><p class=bad>недоступен: {html.escape(repr(e)[:200])}</p>"
+        rows = "".join(
+            f"<tr><td>{html.escape(r)}</td><td>{v['tags']}</td><td>{html.escape(', '.join(v['moving']) or '—')}</td>"
+            f"<td>{len(v['drop'])}</td></tr>" for r, v in plan["repos"].items())
+        size = storage_bytes() / 1e6
+        last = CLEANUP.get("last")
+        last_s = ("идёт уборка…" if CLEANUP["running"] else
+                  f"последняя уборка {html.escape(last['finished_at'])} ({html.escape(last['by'])}): удалено "
+                  f"{len(last['deleted'])}, ошибок {len(last['errors'])}, "
+                  f"{last['bytes_before'] / 1e6:.0f} → {last['bytes_after'] / 1e6:.0f} МБ" if last else "уборок ещё не было")
+        form = (f"<form method=post action=/ui/registry/cleanup>оставить последних сборок на образ: "
+                f"<input name=keep size=3 value={REGISTRY_KEEP}> <button>Убрать старое</button></form>"
+                if who in ADMINS else "<p class=muted>уборку запускают администраторы сборщика</p>")
+        return (f"<h3 id=registry>Реестр <span class=muted>— {size:.0f} МБ</span></h3>"
+                f"<table><tr><th>образ</th><th>тегов</th><th>подвижные теги</th>"
+                f"<th>к удалению при «последних {REGISTRY_KEEP}»</th></tr>{rows}</table>"
+                f"<p class=muted>{last_s}</p>{form}")
 
     def submit(self, q: dict, who: str) -> None:
         recipe, commit = q.get("recipe", ""), q.get("commit", "").lower()
@@ -919,7 +1081,7 @@ LOGIN_HTML = """<!doctype html><meta charset=utf-8><title>g9s builder</title><st
 LIST_HTML = """<!doctype html><meta charset=utf-8><title>g9s builder</title><style>{css}</style>
 <h2>g9s builder <span class=muted>— {who}</span> <a href=/ui/logout class=muted style="font-size:.8em">выйти</a></h2>
 <p>{running}</p><table><tr><th>сборка</th><th>рецепт</th><th>коммит</th><th>кто</th><th>статус</th><th>стадия</th>
-<th>длительность</th></tr>{rows}</table><p class=muted>{stats}</p>"""
+<th>длительность</th></tr>{rows}</table><p class=muted>{stats}</p>{registry}"""
 
 BUILD_HTML = """<!doctype html><meta charset=utf-8><title>{id}</title><style>{css}</style>
 <p><a href=/ui>← сборки</a></p><h2>{id}</h2><dl id=meta></dl><h3>Артефакты</h3><ul id=art></ul>

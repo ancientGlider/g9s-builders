@@ -66,19 +66,22 @@ services:
       - registry
     restart: unless-stopped
   runner:
-    image: ghcr.io/ancientglider/g9s-builders/java:v0.3.1
+    image: ghcr.io/ancientglider/g9s-builders/java:v0.4.0
     network_mode: "service:vpn"
     environment:
       DOCKER_HOST: tcp://dind:2375
       G9S_RUNNER_TOKENS: /etc/g9s/files/tokens
       G9S_REGISTRY: registry:5000
       G9S_REGISTRY_NAMESPACE: builds
+      G9S_REGISTRY_KEEP: "10"
+      G9S_ADMINS: ""            # names from the tokens file allowed to clean the registry
       G9S_RECIPE_FILES: /etc/g9s/files
       NPM_CONFIG_USERCONFIG: /etc/g9s/files/npmrc
       G9S_KEEP_BUILDS: "5"
       G9S_BUILD_TIMEOUT: "7200"
     volumes:
       - builds:/data
+      - registry-data:/var/lib/registry   # same storage as the registry: retention runs garbage-collect
       - m2:/root/.m2
       - npm-cache:/root/.npm
     depends_on:
