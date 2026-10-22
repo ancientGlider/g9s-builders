@@ -24,7 +24,7 @@ deploy/governetics/*.yml        образец шаблона проекта д�
 
 | Образ | Что внутри |
 |---|---|
-| `ghcr.io/ancientglider/g9s-builders/java` | JDK 25 (Temurin), Node 24, Docker CLI + buildx, git, python3, `LANG=C.UTF-8` |
+| `ghcr.io/ancientglider/g9s-builders/java` | JDK 25 (Temurin), Node 24, python3, Docker CLI + buildx + compose, git, `LANG=C.UTF-8` |
 | `ghcr.io/ancientglider/g9s-builders/openvpn` | клиент OpenVPN (Alpine); профиль и логин — файлами проекта |
 
 Образы собираются только для `linux/amd64`. Демон Docker для сборок — отдельный контейнер `dind` в том же проекте
@@ -100,6 +100,8 @@ poll=60            # период опроса, секунды
 Рецепт — скрипт `bash`, который раннер запускает в корне выкаченного коммита. Он читает `G9S_SRC`, `G9S_COMMIT`,
 `G9S_SHA7`, `G9S_PARAM_*` (параметры `-p` клиента, ключ в верхнем регистре), пишет артефакты в `G9S_OUT` и
 завершается `0` при успехе; всё, что он печатает, попадает в `build.log`. Docker доступен через `DOCKER_HOST`.
+Рецепт из файла проекта может быть одной строкой, передающей управление скрипту из собираемого коммита
+(`exec bash "$G9S_SRC/<путь>/build.sh"`) — тогда логика сборки версионируется вместе с кодом.
 Для сводки тестов Maven в образе есть `/opt/g9s/runner/summarize_tests.py <корень> --gate "<итог>" --command "<команда>"`.
 
 Два источника рецептов:

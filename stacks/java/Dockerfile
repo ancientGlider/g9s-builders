@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Stack «java»: JDK 25 (Temurin) + Node 24 + Docker CLI + the g9s runner.
+# Stack «java»: JDK 25 (Temurin) + Node 24 + python3 + Docker CLI (buildx, compose) + the g9s runner.
 # Built for linux/amd64 only (the nodes it runs on are x86_64). Base images are
 # pinned by digest; bump the digest and the comment together.
 
@@ -26,6 +26,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 # Docker CLI + buildx plugin; the daemon is a sibling container (DOCKER_HOST).
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
 # UTF-8 locale: Maven Enforcer rules in some projects reject POSIX file-name encoding.
 ENV LANG=C.UTF-8 \
