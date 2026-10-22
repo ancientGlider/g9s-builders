@@ -1,0 +1,20 @@
+# Read-only gate in front of the build registry: only GET/HEAD under /v2/ pass, with a reader login.
+# Writes come from inside the project only (the builder pushes to registry:5000 directly), the same
+# perimeter rule the governetics panel mirror uses. TLS is the edge's job; this listens plain HTTP.
+# `route` keeps the order as written: Caddy would otherwise sort `handle` ahead of `respond`.
+:9192 {
+	route {
+		@write not method GET HEAD
+		respond @write "registry is read-only from outside" 405
+
+		@v2 path /v2 /v2/*
+		handle @v2 {
+			basic_auth {
+				{$REGISTRY_READER_USER} {$REGISTRY_READER_HASH}
+			}
+			reverse_proxy registry:5000
+		}
+
+		respond "not found" 404
+	}
+}

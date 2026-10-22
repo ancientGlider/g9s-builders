@@ -16,6 +16,10 @@ user:password>) makes the runner poll that repository's tags and build every new
 regex, and lets clients ask for a build of any ref with POST /api/builds?recipe=…&ref=…; the
 bundle upload keeps working alongside (branches, or no repository access yet).
 
+Publishing: with G9S_REGISTRY set, every image archive (*.tar from `docker save`) a succeeded build leaves in
+its output is loaded and pushed as <registry>/<namespace>/<name>:<sha7>; the parameter publish=<tag> also moves
+that tag (e.g. «stand», which a stand updater watches) to the same digest. Archives stay artifacts as before.
+
 Authentication: Bearer tokens from G9S_RUNNER_TOKENS, one «name=token» per line. The file is
 re-read on every request, so rotating a token is a file write, no restart. Everything but
 /api/health needs a token. A token lets its holder run arbitrary code inside the builder:
@@ -58,6 +62,9 @@ MAX_UPLOAD = int(os.environ.get("G9S_MAX_UPLOAD_MB", "512")) * 1024 * 1024
 SILENCE_WARN = int(os.environ.get("G9S_SILENCE_WARN", "600"))   # no output for this long → «stalled» flag
 SILENCE_KILL = int(os.environ.get("G9S_SILENCE_KILL", "0"))     # … and for this long → kill (0 = never)
 MONITOR_STEP = 5
+REGISTRY = os.environ.get("G9S_REGISTRY", "")                    # e.g. registry:5000; empty = no publishing
+REGISTRY_NS = os.environ.get("G9S_REGISTRY_NAMESPACE", "builds")
+MOVING_TAG_RE = re.compile(r"^[a-z][a-z0-9._-]{0,63}$")
 ASKPASS = Path(__file__).resolve().parent / "askpass.sh"
 REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+-]{0,200}$")
 AUTH_FAIL_LIMIT = int(os.environ.get("G9S_AUTH_FAIL_LIMIT", "60"))   # failed auths per minute per client address …
@@ -453,6 +460,43 @@ def stats(recipe: str | None) -> dict:
             "stages": {k: {"median_s": round(statistics.median(v)), "n": len(v)} for k, v in stages.items()}}
 
 
+def publish_images(meta: dict, out: Path, say) -> list[dict]:
+    """Push the build's image archives to the registry; never raises, failures are recorded per image."""
+    moving = meta["params"].get("publish", "")
+    if moving and not MOVING_TAG_RE.match(moving):
+        say(f"publish: bad tag name «{moving}», moving tag skipped")
+        moving = ""
+    done = []
+    for tar in sorted(out.glob("*.tar")):
+        load = subprocess.run(["docker", "load", "-i", str(tar)], capture_output=True, text=True, timeout=1800)
+        names = [l.split(":", 1)[1].strip() for l in load.stdout.splitlines() if l.startswith("Loaded image:")]
+        if load.returncode != 0 or not names:
+            say(f"publish: {tar.name} is not an image archive, skipped")
+            continue
+        for src in names:
+            repo = src.rsplit("/", 1)[-1].split(":", 1)[0]
+            target = f"{REGISTRY}/{REGISTRY_NS}/{repo}"
+            tags = [meta["sha7"]] + ([moving] if moving else [])
+            item = {"image": f"{REGISTRY_NS}/{repo}", "tags": tags, "digest": None, "error": None}
+            try:
+                for tag in tags:
+                    subprocess.run(["docker", "tag", src, f"{target}:{tag}"], check=True, capture_output=True, timeout=60)
+                    push = subprocess.run(["docker", "push", f"{target}:{tag}"], capture_output=True, text=True, timeout=1800)
+                    if push.returncode != 0:
+                        raise RuntimeError((push.stderr or push.stdout).strip().splitlines()[-1])
+                    m = re.search(r"digest: (sha256:[0-9a-f]{64})", push.stdout)
+                    item["digest"] = m.group(1) if m else item["digest"]
+                say(f"publish: {item['image']}:{','.join(tags)} → {item['digest']}")
+            except Exception as e:  # noqa: BLE001
+                item["error"] = str(e)[:300]
+                say(f"publish: {item['image']} failed: {item['error']}")
+            finally:
+                subprocess.run(["docker", "image", "rm", "-f", src, *[f"{target}:{t}" for t in tags]],
+                               capture_output=True, timeout=120)
+            done.append(item)
+    return done
+
+
 def run_build(bid: str) -> None:
     meta = load_meta(bid)
     if not meta or meta["status"] != "queued":
@@ -502,6 +546,12 @@ def run_build(bid: str) -> None:
             else:
                 status = "cancelled" if CURRENT["cancel"] else ("succeeded" if rc == 0 else "failed")
             close_stage(time.monotonic())
+            if status == "succeeded" and REGISTRY:
+                (bdir / "stage").write_text("publish\n")
+                CURRENT["timeline"].append({"stage": "publish", "started_at": now_iso(), "duration_s": None,
+                                            "_t0": time.monotonic()})
+                meta["published"] = publish_images(meta, out, say)
+                close_stage(time.monotonic())
             ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
             meta["cpu_s"] = round((ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime))
             meta["timeline"] = list(CURRENT["timeline"])
