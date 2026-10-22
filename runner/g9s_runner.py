@@ -552,6 +552,11 @@ def run_build(bid: str) -> None:
                                             "_t0": time.monotonic()})
                 meta["published"] = publish_images(meta, out, say)
                 close_stage(time.monotonic())
+                if any(i.get("error") for i in meta["published"]):
+                    # artifacts exist, but whoever waits for the stand would get a silent no-op: make it red
+                    status = "failed"
+                    meta["note"] = "build succeeded, publishing to the registry failed (see «publish:» lines)"
+                    say("publish failed — build marked failed; the archives are still available")
             ru1 = resource.getrusage(resource.RUSAGE_CHILDREN)
             meta["cpu_s"] = round((ru1.ru_utime - ru0.ru_utime) + (ru1.ru_stime - ru0.ru_stime))
             meta["timeline"] = list(CURRENT["timeline"])
