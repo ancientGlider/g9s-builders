@@ -252,7 +252,11 @@ def git_env(cfg: dict) -> dict:
     """Environment for git talking to the remote: askpass from the credentials file, no prompts."""
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     if cfg.get("credentials"):
-        user, _, password = Path(cfg["credentials"]).read_text().strip().partition(":")
+        raw = Path(cfg["credentials"]).read_text().strip()
+        user, sep, password = raw.partition(":")
+        if not sep:
+            # a bare token: GitLab / GitHub accept any user name with a token as the password
+            user, password = cfg.get("user") or "g9s-builder", raw
         env.update(GIT_ASKPASS=str(ASKPASS), G9S_GIT_USER=user, G9S_GIT_PASSWORD=password)
     return env
 

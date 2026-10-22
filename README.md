@@ -61,7 +61,8 @@ poll=60            # период опроса, секунды
 ```
 
 Учётные данные — файл `git_credentials.<рецепт>` (или общий `git_credentials`) со строкой `логин:пароль`
-(для GitLab — deploy token с `read_repository`). Раннер раз в `poll` секунд делает `git ls-remote --tags`;
+(для GitLab — deploy или project access token с `read_repository`); голый токен без логина тоже принимается —
+логином станет `user=` из `repo.<рецепт>` либо `g9s-builder`. Раннер раз в `poll` секунд делает `git ls-remote --tags`;
 при первом опросе запоминает существующие теги и ничего не собирает, дальше каждый **новый** тег под шаблон
 ставится в очередь (`trigger: tag:<имя>`, `submitted_by: tag-poll`). Любой ref можно собрать руками:
 `g9s-build --pull <ветка|тег|sha>` → `POST /api/builds?recipe=…&ref=…`. Состояние опроса — в `/api/health`
