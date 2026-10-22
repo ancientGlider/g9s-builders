@@ -21,11 +21,10 @@ x-g9s-config:
     repo.example: {consumers: [runner], mode: "0444", presence: optional}
     git_credentials.example: {consumers: [runner], visibility: invisible, mode: "0400", presence: optional}
     vpn.ovpn: {consumers: [vpn], visibility: invisible, mode: "0400"}
-    vpn_user: {consumers: [vpn], visibility: invisible, mode: "0400"}
-    vpn_password: {consumers: [vpn], visibility: invisible, mode: "0400"}
+    vpn_auth: {consumers: [vpn], visibility: invisible, mode: "0400"}
 services:
   vpn:
-    image: ghcr.io/ancientglider/g9s-builders/openvpn:v0.1.0
+    image: ghcr.io/ancientglider/g9s-builders/openvpn:v0.1.1
     cap_add:
       - NET_ADMIN
     devices:

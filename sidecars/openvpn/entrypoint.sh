@@ -1,20 +1,28 @@
 #!/bin/sh
 # Starts an OpenVPN client from a profile and a login delivered as files.
 #   OVPN_CONFIG        profile (.ovpn); default /etc/g9s/files/vpn.ovpn
-#   OVPN_USER_FILE     first line = user name;  default /etc/g9s/files/vpn_user
-#   OVPN_PASSWORD_FILE first line = password;   default /etc/g9s/files/vpn_password
+#   OVPN_AUTH_FILE     two lines: user name, password (OpenVPN auth-user-pass format); default /etc/g9s/files/vpn_auth
+#   OVPN_USER_FILE     first line = user name;  default /etc/g9s/files/vpn_user      (used when there is no auth file)
+#   OVPN_PASSWORD_FILE first line = password;   default /etc/g9s/files/vpn_password  (used when there is no auth file)
 #   OVPN_LEGACY=1      allow legacy ciphers / TLS 1.0 for old servers (default 1)
 #   OVPN_EXTRA         extra openvpn arguments
 # The profile is adapted for OpenVPN 2.6 / OpenSSL 3 in a copy; the delivered file is not touched.
 set -eu
 umask 077
 CONFIG="${OVPN_CONFIG:-/etc/g9s/files/vpn.ovpn}"
+AUTH_FILE="${OVPN_AUTH_FILE:-/etc/g9s/files/vpn_auth}"
 USER_FILE="${OVPN_USER_FILE:-/etc/g9s/files/vpn_user}"
 PASS_FILE="${OVPN_PASSWORD_FILE:-/etc/g9s/files/vpn_password}"
-for f in "$CONFIG" "$USER_FILE" "$PASS_FILE"; do
-  [ -r "$f" ] || { echo "openvpn sidecar: $f is missing or unreadable"; exit 2; }
-done
-{ head -n1 "$USER_FILE"; head -n1 "$PASS_FILE"; } | tr -d '\r' > /tmp/auth.txt
+[ -r "$CONFIG" ] || { echo "openvpn sidecar: $CONFIG is missing or unreadable"; exit 2; }
+if [ -r "$AUTH_FILE" ]; then
+  # first two lines, CR stripped, each ending with a newline even if the upload had none
+  { sed -n '1p' "$AUTH_FILE"; sed -n '2p' "$AUTH_FILE"; } | tr -d '\r' > /tmp/auth.txt
+elif [ -r "$USER_FILE" ] && [ -r "$PASS_FILE" ]; then
+  { sed -n '1p' "$USER_FILE"; sed -n '1p' "$PASS_FILE"; } | tr -d '\r' > /tmp/auth.txt
+else
+  echo "openvpn sidecar: no login — provide $AUTH_FILE (two lines) or $USER_FILE + $PASS_FILE"; exit 2
+fi
+[ "$(grep -c . /tmp/auth.txt)" = 2 ] || { echo "openvpn sidecar: the login must be two non-empty lines (user, password)"; exit 2; }
 sed -e 's/^ns-cert-type server/remote-cert-tls server/' \
     -e 's#^auth-user-pass.*#auth-user-pass /tmp/auth.txt#' \
     "$CONFIG" > /tmp/client.conf

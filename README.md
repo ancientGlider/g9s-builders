@@ -25,7 +25,7 @@ deploy/governetics/*.yml        образец шаблона проекта д�
 | Образ | Что внутри |
 |---|---|
 | `ghcr.io/ancientglider/g9s-builders/java` | JDK 25 (Temurin), Node 24, python3, Docker CLI + buildx + compose, git, `LANG=C.UTF-8` |
-| `ghcr.io/ancientglider/g9s-builders/openvpn` | клиент OpenVPN (Alpine); профиль и логин — файлами проекта |
+| `ghcr.io/ancientglider/g9s-builders/openvpn` | клиент OpenVPN (Alpine); профиль `vpn.ovpn` и логин `vpn_auth` (две строки: пользователь, пароль) — файлами проекта |
 
 Образы собираются только для `linux/amd64`. Демон Docker для сборок — отдельный контейнер `dind` в том же проекте
 панели (свой том образов, сокет хоста не нужен). Привилегированный контейнер `dind` — это по сути root на узле:
